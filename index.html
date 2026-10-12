@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hard Sets → Strava</title>
+<meta name="robots" content="noindex">
+<style>
+:root{color-scheme:light dark;--bg:#131412;--surface:#1c1d1a;--line:#33352f;--ink:#ecebe3;--ink-2:#b5b3a8;--ink-3:#86847a;--accent:#3987e5;--good:#0ca30c;--crit:#d03b3b}
+@media (prefers-color-scheme:light){:root{--bg:#f4f3ee;--surface:#fff;--line:#dcd9cf;--ink:#161712;--ink-2:#54534c;--ink-3:#86847a;--accent:#2a78d6}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;padding:16px;padding-top:calc(16px + env(safe-area-inset-top,0px))}
+main{max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:22px;margin:0;letter-spacing:.02em;text-transform:uppercase}
+h2{font-size:17px;margin:0}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px}
+label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);font-weight:600;display:block;margin-bottom:4px}
+input,textarea{width:100%;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+textarea{min-height:180px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+button,.btn{font:inherit;font-weight:600;min-height:44px;padding:0 16px;border-radius:9px;border:1px solid var(--line);background:var(--surface);color:var(--ink);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.muted{color:var(--ink-2);font-size:14px}
+.small{font-size:13px;color:var(--ink-3)}
+.ok{color:var(--good);font-weight:600}
+.err{color:var(--crit);font-weight:600}
+ol{margin:0;padding-left:20px;font-size:14px;color:var(--ink-2)}
+ol li{margin:4px 0}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;background:var(--bg);padding:1px 5px;border-radius:4px}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>Hard Sets → Strava</h1>
+  <p class="muted">A one-file bridge: it holds your own Strava API app credentials in this browser and creates Weight Training activities with the workout details Hard Sets hands it in the link.</p>
+
+  <section class="card" id="setup">
+    <h2>1 · Strava API app</h2>
+    <ol>
+      <li>Open <a href="https://www.strava.com/settings/api" target="_blank" rel="noopener">strava.com/settings/api</a> and create an app (any name, category "Training").</li>
+      <li>Set <b>Authorization Callback Domain</b> to this page's host: <code id="host"></code></li>
+      <li>Paste the Client ID and Client Secret below. They never leave this browser.</li>
+    </ol>
+    <div><label for="cid">Client ID</label><input id="cid" inputmode="numeric" autocomplete="off"></div>
+    <div><label for="csec">Client Secret</label><input id="csec" type="password" autocomplete="off"></div>
+    <div class="row"><button class="primary" id="save">Save</button><span class="small" id="savemsg"></span></div>
+  </section>
+
+  <section class="card" id="auth">
+    <h2>2 · Connect your Strava account</h2>
+    <p class="muted" id="authstate">Not connected.</p>
+    <div class="row"><button class="primary" id="connect">Connect Strava</button><button id="disconnect" class="hidden">Disconnect</button></div>
+  </section>
+
+  <section class="card" id="push">
+    <h2>3 · Push this workout</h2>
+    <p class="muted" id="pushhint">Open this page from a finished workout in Hard Sets and the details land here.</p>
+    <div id="form" class="hidden">
+      <div><label for="name">Activity name</label><input id="name"></div>
+      <div class="row">
+        <div style="flex:1;min-width:160px"><label for="start">Start (local)</label><input id="start"></div>
+        <div style="flex:1;min-width:120px"><label for="dur">Duration (min)</label><input id="dur" inputmode="numeric"></div>
+      </div>
+      <div><label for="desc">Description</label><textarea id="desc"></textarea></div>
+      <div class="row"><button class="primary" id="send">Push to Strava</button><span id="result"></span></div>
+    </div>
+  </section>
+  <p class="small">Scopes requested: <code>activity:write</code> and <code>read</code>. Tokens refresh automatically. Nothing is sent anywhere except Strava's API.</p>
+</main>
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const store = {get(k, d){ try { const v = localStorage.getItem('sb:' + k); return v == null ? d : JSON.parse(v); } catch(e){ return d; } }, set(k, v){ try { localStorage.setItem('sb:' + k, JSON.stringify(v)); } catch(e){} }, del(k){ try { localStorage.removeItem('sb:' + k); } catch(e){} }};
+const selfUrl = location.origin + location.pathname;
+$('#host').textContent = location.host;
+
+function b64urlDecode(s){ s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return decodeURIComponent(escape(atob(s))); }
+function readPayload(){
+  const h = location.hash.replace(/^#/, '');
+  if (h.length > 10) { try { const p = JSON.parse(b64urlDecode(h)); store.set('pending', p); history.replaceState(null, '', selfUrl); return p; } catch(e) { console.warn('bad payload', e); } }
+  return store.get('pending', null);
+}
+function cfg(){ return {cid: store.get('cid', ''), csec: store.get('csec', '')}; }
+function tokens(){ return store.get('tok', null); }
+
+function renderSetup(){
+  const c = cfg();
+  $('#cid').value = c.cid; $('#csec').value = c.csec;
+  $('#savemsg').textContent = c.cid && c.csec ? 'Saved in this browser.' : '';
+}
+function renderAuth(){
+  const t = tokens(); const c = cfg();
+  if (t && t.refresh_token) { $('#authstate').innerHTML = `<span class="ok">Connected</span>${t.athlete ? ' as ' + t.athlete : ''}. Access token ${t.expires_at * 1000 > Date.now() ? 'valid' : 'expired (will refresh)'}.`; $('#connect').textContent = 'Reconnect'; $('#disconnect').classList.remove('hidden'); }
+  else { $('#authstate').textContent = c.cid && c.csec ? 'Not connected yet.' : 'Save your Client ID and Secret first.'; $('#connect').disabled = !(c.cid && c.csec); $('#disconnect').classList.add('hidden'); }
+}
+function renderPush(p){
+  if (!p) { $('#form').classList.add('hidden'); return; }
+  $('#form').classList.remove('hidden');
+  $('#pushhint').textContent = 'Review, then push. Loads in lb; @n means reps in reserve.';
+  $('#name').value = p.name || 'Lifting';
+  $('#start').value = (p.start_date_local || '').replace(/([+-]\d\d:\d\d|Z)$/, '');
+  $('#dur').value = Math.round((p.elapsed_time || 3600) / 60);
+  $('#desc').value = p.description || '';
+  const done = store.get('done', []);
+  if (p.start_date_local && done.includes(p.start_date_local)) $('#result').innerHTML = '<span class="small">Already pushed once; push again only if you deleted it on Strava.</span>';
+}
+
+$('#save').onclick = () => { store.set('cid', $('#cid').value.trim()); store.set('csec', $('#csec').value.trim()); renderSetup(); renderAuth(); };
+$('#connect').onclick = () => {
+  const c = cfg(); if (!c.cid) return;
+  const u = new URL('https://www.strava.com/oauth/authorize');
+  u.searchParams.set('client_id', c.cid); u.searchParams.set('redirect_uri', selfUrl); u.searchParams.set('response_type', 'code');
+  u.searchParams.set('approval_prompt', 'auto'); u.searchParams.set('scope', 'activity:write,read');
+  location.href = u.toString();
+};
+$('#disconnect').onclick = () => { store.del('tok'); renderAuth(); };
+
+async function tokenRequest(body){
+  const c = cfg();
+  const r = await fetch('https://www.strava.com/oauth/token', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(Object.assign({client_id: c.cid, client_secret: c.csec}, body))});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.message || ('Token request failed (' + r.status + ')'));
+  const t = {access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at, athlete: j.athlete ? [j.athlete.firstname, j.athlete.lastname].filter(Boolean).join(' ') : (tokens() || {}).athlete};
+  store.set('tok', t); return t;
+}
+async function handleCallback(){
+  const q = new URLSearchParams(location.search);
+  if (!q.get('code')) return;
+  history.replaceState(null, '', selfUrl);
+  if (q.get('error')) { $('#authstate').innerHTML = '<span class="err">Strava refused: ' + q.get('error') + '</span>'; return; }
+  const scope = q.get('scope') || '';
+  if (!scope.includes('activity:write')) { $('#authstate').innerHTML = '<span class="err">You did not grant activity:write; pushing will fail. Reconnect and tick "Upload your activities".</span>'; }
+  try { await tokenRequest({code: q.get('code'), grant_type: 'authorization_code'}); } catch(e) { $('#authstate').innerHTML = '<span class="err">' + e.message + '</span>'; }
+}
+async function freshToken(){
+  let t = tokens(); if (!t) throw new Error('Connect Strava first.');
+  if (t.expires_at * 1000 < Date.now() + 60000) t = await tokenRequest({refresh_token: t.refresh_token, grant_type: 'refresh_token'});
+  return t.access_token;
+}
+$('#send').onclick = async () => {
+  const btn = $('#send'); const res = $('#result'); btn.disabled = true; res.textContent = 'Pushing…';
+  try {
+    const at = await freshToken();
+    const p = store.get('pending', {}) || {};
+    const start = $('#start').value.trim();
+    const body = {name: $('#name').value.trim() || 'Lifting', sport_type: 'WeightTraining', start_date_local: start.replace(/([+-]\d\d:\d\d|Z)$/, '') + 'Z', elapsed_time: Math.max(60, Math.round(parseFloat($('#dur').value || '60') * 60)), description: $('#desc').value};
+    const r = await fetch('https://www.strava.com/api/v3/activities', {method: 'POST', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.message || 'Strava error') + (j.errors ? ': ' + j.errors.map(e => e.field + ' ' + e.code).join(', ') : '') + ' (' + r.status + ')');
+    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a>`;
+    if (p.start_date_local) { const d = store.get('done', []); d.push(p.start_date_local); store.set('done', d.slice(-100)); }
+  } catch(e) { res.innerHTML = '<span class="err">' + e.message + '</span>'; }
+  btn.disabled = false;
+};
+
+(async () => {
+  renderSetup();
+  const payload = readPayload();
+  await handleCallback();
+  renderAuth();
+  renderPush(payload);
+})();
+</script>
+</body>
+</html>
