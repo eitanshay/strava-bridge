@@ -159,7 +159,8 @@ $('#send').onclick = async () => {
     const r = await fetch('https://www.strava.com/api/v3/activities', {method: 'POST', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((j.message || 'Strava error') + (j.errors ? ': ' + j.errors.map(e => e.field + ' ' + e.code).join(', ') : '') + ' (' + r.status + ')');
-    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a>`;
+    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab.</span>`;
+    document.title = 'Pushed to Strava';
     if (p.start_date_local) { const d = store.get('done', []); d.push(p.start_date_local); store.set('done', d.slice(-100)); }
   } catch(e) { res.innerHTML = '<span class="err">' + e.message + '</span>'; }
   btn.disabled = false;
@@ -171,6 +172,13 @@ $('#send').onclick = async () => {
   await handleCallback();
   renderAuth();
   renderPush(payload);
+  // Hard Sets opens this page with auto:true after a save: push without waiting for a tap once the account is connected
+  if (payload && payload.auto && tokens() && tokens().refresh_token && !store.get('done', []).includes(payload.start_date_local)) {
+    $('#pushhint').textContent = 'Pushing automatically…';
+    $('#send').click();
+  } else if (payload && payload.auto && !(tokens() && tokens().refresh_token)) {
+    $('#pushhint').textContent = 'Connect Strava once (step 2) and this workout will be pushed right away.';
+  }
 })();
 </script>
 </body>
