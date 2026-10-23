@@ -77,11 +77,12 @@ a{color:var(--text-primary)}a:hover{color:var(--signal-press)}
       <div class="row"><button class="primary" id="send">Push to Strava</button><span id="result"></span></div>
     </div>
   </section>
-  <p class="small">Scopes requested: <code>activity:write</code> and <code>read</code>. Tokens refresh automatically. Nothing is sent anywhere except Strava's API.</p>
+  <p class="small">Scopes requested: <code>activity:write</code> and <code>activity:read_all</code> (the read scope lets the bridge find an activity it already created and update it instead of creating a duplicate). Tokens refresh automatically. Nothing is sent anywhere except Strava's API.</p>
 </main>
 <script>
 'use strict';
 const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const store = {get(k, d){ try { const v = localStorage.getItem('sb:' + k); return v == null ? d : JSON.parse(v); } catch(e){ return d; } }, set(k, v){ try { localStorage.setItem('sb:' + k, JSON.stringify(v)); } catch(e){} }, del(k){ try { localStorage.removeItem('sb:' + k); } catch(e){} }};
 const selfUrl = location.origin + location.pathname;
 $('#host').textContent = location.host;
@@ -94,6 +95,29 @@ function readPayload(){
 }
 function cfg(){ return {cid: store.get('cid', ''), csec: store.get('csec', '')}; }
 function tokens(){ return store.get('tok', null); }
+function canRead(){ const t = tokens(); return !!(t && t.scope && /activity:read/.test(t.scope)); }
+// Epoch ms of the start field: keep the zone the app sent when the field was not edited, else the browser's zone
+function startEpoch(startLocal, p){
+  const sent = (p && p.start_date_local) || '';
+  if (sent && sent.replace(/([+-]\d\d:\d\d|Z)$/, '') === startLocal && /([+-]\d\d:\d\d|Z)$/.test(sent)) { const t = Date.parse(sent); if (!isNaN(t)) return t; }
+  const t = new Date(startLocal).getTime(); return isNaN(t) ? Date.now() : t;
+}
+const LIFT_TYPES = ['WeightTraining', 'Workout', 'Crossfit', 'HighIntensityIntervalTraining'];
+// An activity of a lifting type that starts within 15 min of ours: the one to update rather than duplicate
+async function findExisting(at, epochMs){
+  const s = Math.floor(epochMs / 1000);
+  const u = new URL('https://www.strava.com/api/v3/athlete/activities'); u.searchParams.set('after', String(s - 900)); u.searchParams.set('before', String(s + 900)); u.searchParams.set('per_page', '10');
+  const r = await fetch(u.toString(), {headers: {'Authorization': 'Bearer ' + at}});
+  if (!r.ok) return null; // no read scope or a hiccup: fall back to creating
+  const list = await r.json().catch(() => []);
+  let best = null, bestGap = Infinity;
+  for (const a of Array.isArray(list) ? list : []) {
+    if (!LIFT_TYPES.includes(a.sport_type || a.type)) continue;
+    const gap = Math.abs(Date.parse(a.start_date) - epochMs);
+    if (gap < bestGap) { best = a; bestGap = gap; }
+  }
+  return bestGap <= 900000 ? best : null;
+}
 
 function renderSetup(){
   const c = cfg();
@@ -102,7 +126,7 @@ function renderSetup(){
 }
 function renderAuth(){
   const t = tokens(); const c = cfg();
-  if (t && t.refresh_token) { $('#authstate').innerHTML = `<span class="ok">Connected</span>${t.athlete ? ' as ' + t.athlete : ''}. Access token ${t.expires_at * 1000 > Date.now() ? 'valid' : 'expired (will refresh)'}.`; $('#connect').textContent = 'Reconnect'; $('#disconnect').classList.remove('hidden'); }
+  if (t && t.refresh_token) { $('#authstate').innerHTML = `<span class="ok">Connected</span>${t.athlete ? ' as ' + t.athlete : ''}. Access token ${t.expires_at * 1000 > Date.now() ? 'valid' : 'expired (will refresh)'}.${canRead() ? '' : ' <span class="small">Reconnect once to grant <code>activity:read_all</code>, so a second push updates the existing activity instead of failing with a duplicate error.</span>'}`; $('#connect').textContent = 'Reconnect'; $('#disconnect').classList.remove('hidden'); }
   else { $('#authstate').textContent = c.cid && c.csec ? 'Not connected yet.' : 'Save your Client ID and Secret first.'; $('#connect').disabled = !(c.cid && c.csec); $('#disconnect').classList.add('hidden'); }
 }
 function renderPush(p){
@@ -114,7 +138,7 @@ function renderPush(p){
   $('#dur').value = Math.round((p.elapsed_time || 3600) / 60);
   $('#desc').value = p.description || '';
   const done = store.get('done', []);
-  if (p.start_date_local && done.includes(p.start_date_local)) $('#result').innerHTML = '<span class="small">Already pushed once; push again only if you deleted it on Strava.</span>';
+  if (p.start_date_local && done.includes(p.start_date_local)) $('#result').innerHTML = '<span class="small">' + (canRead() ? 'Already pushed from this browser; pushing again updates the Strava entry.' : 'Already pushed from this browser; Strava refuses a second activity at the same time.') + '</span>';
 }
 
 $('#save').onclick = () => { store.set('cid', $('#cid').value.trim()); store.set('csec', $('#csec').value.trim()); renderSetup(); renderAuth(); };
@@ -122,17 +146,18 @@ $('#connect').onclick = () => {
   const c = cfg(); if (!c.cid) return;
   const u = new URL('https://www.strava.com/oauth/authorize');
   u.searchParams.set('client_id', c.cid); u.searchParams.set('redirect_uri', selfUrl); u.searchParams.set('response_type', 'code');
-  u.searchParams.set('approval_prompt', 'auto'); u.searchParams.set('scope', 'activity:write,read');
+  u.searchParams.set('approval_prompt', 'auto'); u.searchParams.set('scope', 'activity:write,activity:read_all');
   location.href = u.toString();
 };
 $('#disconnect').onclick = () => { store.del('tok'); renderAuth(); };
 
-async function tokenRequest(body){
+async function tokenRequest(body, scope){
   const c = cfg();
   const r = await fetch('https://www.strava.com/oauth/token', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(Object.assign({client_id: c.cid, client_secret: c.csec}, body))});
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.message || ('Token request failed (' + r.status + ')'));
-  const t = {access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at, athlete: j.athlete ? [j.athlete.firstname, j.athlete.lastname].filter(Boolean).join(' ') : (tokens() || {}).athlete};
+  const prev = tokens() || {};
+  const t = {access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at, athlete: j.athlete ? [j.athlete.firstname, j.athlete.lastname].filter(Boolean).join(' ') : prev.athlete, scope: scope || prev.scope || ''};
   store.set('tok', t); return t;
 }
 async function handleCallback(){
@@ -142,27 +167,45 @@ async function handleCallback(){
   if (q.get('error')) { $('#authstate').innerHTML = '<span class="err">Strava refused: ' + q.get('error') + '</span>'; return; }
   const scope = q.get('scope') || '';
   if (!scope.includes('activity:write')) { $('#authstate').innerHTML = '<span class="err">You did not grant activity:write; pushing will fail. Reconnect and tick "Upload your activities".</span>'; }
-  try { await tokenRequest({code: q.get('code'), grant_type: 'authorization_code'}); } catch(e) { $('#authstate').innerHTML = '<span class="err">' + e.message + '</span>'; }
+  try { await tokenRequest({code: q.get('code'), grant_type: 'authorization_code'}, scope); } catch(e) { $('#authstate').innerHTML = '<span class="err">' + e.message + '</span>'; }
 }
 async function freshToken(){
   let t = tokens(); if (!t) throw new Error('Connect Strava first.');
   if (t.expires_at * 1000 < Date.now() + 60000) t = await tokenRequest({refresh_token: t.refresh_token, grant_type: 'refresh_token'});
   return t.access_token;
 }
+function markDone(p){ if (p && p.start_date_local) { const d = store.get('done', []); if (!d.includes(p.start_date_local)) d.push(p.start_date_local); store.set('done', d.slice(-100)); } }
 $('#send').onclick = async () => {
   const btn = $('#send'); const res = $('#result'); btn.disabled = true; res.textContent = 'Pushing…';
   try {
     const at = await freshToken();
     const p = store.get('pending', {}) || {};
-    const start = $('#start').value.trim();
-    const body = {name: $('#name').value.trim() || 'Lifting', sport_type: 'WeightTraining', start_date_local: start.replace(/([+-]\d\d:\d\d|Z)$/, '') + 'Z', elapsed_time: Math.max(60, Math.round(parseFloat($('#dur').value || '60') * 60)), description: $('#desc').value};
+    const start = $('#start').value.trim().replace(/([+-]\d\d:\d\d|Z)$/, '');
+    const name = $('#name').value.trim() || 'Lifting';
+    const description = $('#desc').value;
+    // Strava rejects a second activity at the same start time with 409. With the read scope, look for one first and update it instead.
+    const existing = canRead() ? await findExisting(at, startEpoch(start, p)) : null;
+    if (existing) {
+      const r = await fetch('https://www.strava.com/api/v3/activities/' + existing.id, {method: 'PUT', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify({name, description})});
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j.message || 'Strava error') + ' (' + r.status + ') while updating the existing activity');
+      res.innerHTML = `<span class="ok">Updated.</span> Strava already had this session (${esc(existing.name || 'activity')}); its name and details now match. <a href="https://www.strava.com/activities/${existing.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab.</span>`;
+      document.title = 'Updated on Strava';
+      markDone(p); btn.disabled = false; return;
+    }
+    const body = {name, sport_type: 'WeightTraining', start_date_local: start + 'Z', elapsed_time: Math.max(60, Math.round(parseFloat($('#dur').value || '60') * 60)), description};
     const r = await fetch('https://www.strava.com/api/v3/activities', {method: 'POST', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     const j = await r.json().catch(() => ({}));
+    if (r.status === 409) {
+      res.innerHTML = `<span class="err">Not created: Strava already has an activity at this start time</span> <span class="small">(that is Strava's duplicate check, error 409). If it is this workout, you are done.${canRead() ? ' It was not of a lifting type, so the bridge did not touch it; edit it on Strava if you want these details in it.' : ' Reconnect in step 2 to grant <code>activity:read_all</code>; the bridge then updates that activity instead of stopping here.'}</span>`;
+      document.title = 'Already on Strava';
+      markDone(p); btn.disabled = false; return;
+    }
     if (!r.ok) throw new Error((j.message || 'Strava error') + (j.errors ? ': ' + j.errors.map(e => e.field + ' ' + e.code).join(', ') : '') + ' (' + r.status + ')');
     res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab.</span>`;
     document.title = 'Pushed to Strava';
-    if (p.start_date_local) { const d = store.get('done', []); d.push(p.start_date_local); store.set('done', d.slice(-100)); }
-  } catch(e) { res.innerHTML = '<span class="err">' + e.message + '</span>'; }
+    markDone(p);
+  } catch(e) { res.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
   btn.disabled = false;
 };
 
@@ -173,8 +216,9 @@ $('#send').onclick = async () => {
   renderAuth();
   renderPush(payload);
   // Hard Sets opens this page with auto:true after a save: push without waiting for a tap once the account is connected
-  if (payload && payload.auto && tokens() && tokens().refresh_token && !store.get('done', []).includes(payload.start_date_local)) {
-    $('#pushhint').textContent = 'Pushing automatically…';
+  // (update:true, sent after an edit in Hard Sets, runs even when this browser pushed the session before)
+  if (payload && payload.auto && tokens() && tokens().refresh_token && (payload.update || !store.get('done', []).includes(payload.start_date_local))) {
+    $('#pushhint').textContent = payload.update ? 'Updating automatically…' : 'Pushing automatically…';
     $('#send').click();
   } else if (payload && payload.auto && !(tokens() && tokens().refresh_token)) {
     $('#pushhint').textContent = 'Connect Strava once (step 2) and this workout will be pushed right away.';
