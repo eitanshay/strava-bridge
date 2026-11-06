@@ -202,7 +202,7 @@ $('#send').onclick = async () => {
       markDone(p); btn.disabled = false; return;
     }
     if (!r.ok) throw new Error((j.message || 'Strava error') + (j.errors ? ': ' + j.errors.map(e => e.field + ' ' + e.code).join(', ') : '') + ' (' + r.status + ')');
-    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab.</span>`;
+    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab. For the muscle-map photo, tap Share image in Hard Sets and add it to the activity in the Strava app (the API cannot attach photos).</span>`;
     document.title = 'Pushed to Strava';
     markDone(p);
   } catch(e) { res.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
