@@ -44,7 +44,7 @@ a{color:var(--text-primary)}a:hover{color:var(--signal-press)}
 <body>
 <main>
   <div class="lockup"><span class="mark" aria-hidden="true"><span class="c"></span><span class="q"></span></span><h1>hard sets → strava</h1></div>
-  <p class="muted">A one-file bridge: it holds your own Strava API app credentials in this browser and creates Weight Training activities with the workout details Hard Sets hands it in the link.</p>
+  <p class="muted">A one-file bridge: it holds your own Strava API app credentials in this browser and creates Weight Training activities, with their sets, from the workout Hard Sets hands it in the link.</p>
 
   <section class="card" id="setup">
     <h2>1 · Strava API app</h2>
@@ -74,10 +74,11 @@ a{color:var(--text-primary)}a:hover{color:var(--signal-press)}
         <div style="flex:1;min-width:120px"><label for="dur">Duration (min)</label><input id="dur" inputmode="numeric"></div>
       </div>
       <div><label for="desc">Description</label><textarea id="desc"></textarea></div>
+      <p class="small" id="setsinfo"></p>
       <div class="row"><button class="primary" id="send">Push to Strava</button><span id="result"></span></div>
     </div>
   </section>
-  <p class="small">Scopes requested: <code>activity:write</code> and <code>activity:read_all</code> (the read scope lets the bridge find an activity it already created and update it instead of creating a duplicate). Tokens refresh automatically. Nothing is sent anywhere except Strava's API.</p>
+  <p class="small">Scopes requested: <code>activity:write</code> and <code>activity:read_all</code> (the read scope lets the bridge find an activity it already created and update its text instead of creating a duplicate). Workouts go up through Strava's upload API as a small strength file with the sets. Tokens refresh automatically. Nothing is sent anywhere except Strava's API.</p>
 </main>
 <script>
 'use strict';
@@ -137,6 +138,7 @@ function renderPush(p){
   $('#start').value = (p.start_date_local || '').replace(/([+-]\d\d:\d\d|Z)$/, '');
   $('#dur').value = Math.round((p.elapsed_time || 3600) / 60);
   $('#desc').value = p.description || '';
+  $('#setsinfo').textContent = hasSets(p) ? p.sets.length + ' sets go to Strava as structured data, so Strava shows its own Volume and muscle map (the Volume line above is then left out).' : 'This push carries text only, no sets, so Strava shows no muscle map.';
   const done = store.get('done', []);
   if (p.start_date_local && done.includes(p.start_date_local)) $('#result').innerHTML = '<span class="small">' + (canRead() ? 'Already pushed from this browser; pushing again updates the Strava entry.' : 'Already pushed from this browser; Strava refuses a second activity at the same time.') + '</span>';
 }
@@ -175,36 +177,81 @@ async function freshToken(){
   return t.access_token;
 }
 function markDone(p){ if (p && p.start_date_local) { const d = store.get('done', []); if (!d.includes(p.start_date_local)) d.push(p.start_date_local); store.set('done', d.slice(-100)); } }
+const hasSets = p => !!(p && Array.isArray(p.sets) && p.sets.length);
+// Strava's strength upload: a small JSON file with the sets. Strava then shows its own Volume and muscle map, as it does for Fitbod or Garmin.
+function setsFile(p, epochMs, elapsed){
+  return {version: '1.0', start_time: new Date(epochMs).toISOString().replace(/\.\d+Z$/, 'Z'),
+    utc_offset: typeof p.utc_offset === 'number' ? p.utc_offset : -new Date(epochMs).getTimezoneOffset() * 60,
+    elapsed_time: elapsed, creator: {name: 'Hard Sets'},
+    sets: p.sets.map(s => { const o = {exercise_type: s[0], repetitions: s[1]}; if (s[2] > 0) o.weight = s[2]; return o; })};
+}
+// Returns {id} on success, {pending:true} when Strava has the file but is still processing, {error} otherwise
+async function uploadSets(at, p, name, description, epochMs, elapsed){
+  const stamp = new Date(epochMs).toISOString().replace(/[-:]/g, '').slice(0, 15);
+  const fd = new FormData();
+  fd.append('file', new Blob([JSON.stringify(setsFile(p, epochMs, elapsed))], {type: 'application/json'}), 'hardsets-' + stamp + '.json');
+  fd.append('data_type', 'json'); fd.append('sport_type', 'WeightTraining'); fd.append('name', name); fd.append('description', description);
+  fd.append('external_id', 'hardsets-' + stamp + (p.resend ? '-' + Date.now().toString(36) : ''));
+  const r = await fetch('https://www.strava.com/api/v3/uploads', {method: 'POST', headers: {'Authorization': 'Bearer ' + at}, body: fd});
+  let j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) return {error: String(j.error || j.message || ('upload refused (' + r.status + ')'))};
+  const id = j.id_str || j.id;
+  if (!id) return {error: 'upload gave no id'};
+  for (let i = 0; i < 20 && !j.activity_id && !j.error; i++) {
+    await new Promise(res => setTimeout(res, 1500));
+    const g = await fetch('https://www.strava.com/api/v3/uploads/' + id, {headers: {'Authorization': 'Bearer ' + at}});
+    j = await g.json().catch(() => ({}));
+  }
+  if (j.activity_id) return {id: j.activity_id};
+  if (j.error) return {error: String(j.error)};
+  return {pending: true};
+}
+async function putText(at, id, name, description){
+  const r = await fetch('https://www.strava.com/api/v3/activities/' + id, {method: 'PUT', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify({name, description})});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.message || 'Strava error') + ' (' + r.status + ') while updating the existing activity');
+}
+const link = id => `<a href="https://www.strava.com/activities/${id}" target="_blank" rel="noopener">Open on Strava</a>`;
 $('#send').onclick = async () => {
   const btn = $('#send'); const res = $('#result'); btn.disabled = true; res.textContent = 'Pushing…';
+  const finish = (html, title, p) => { res.innerHTML = html; if (title) document.title = title; if (p) markDone(p); btn.disabled = false; };
   try {
     const at = await freshToken();
     const p = store.get('pending', {}) || {};
     const start = $('#start').value.trim().replace(/([+-]\d\d:\d\d|Z)$/, '');
     const name = $('#name').value.trim() || 'Lifting';
     const description = $('#desc').value;
-    // Strava rejects a second activity at the same start time with 409. With the read scope, look for one first and update it instead.
-    const existing = canRead() ? await findExisting(at, startEpoch(start, p)) : null;
-    if (existing) {
-      const r = await fetch('https://www.strava.com/api/v3/activities/' + existing.id, {method: 'PUT', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify({name, description})});
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error((j.message || 'Strava error') + ' (' + r.status + ') while updating the existing activity');
-      res.innerHTML = `<span class="ok">Updated.</span> Strava already had this session (${esc(existing.name || 'activity')}); its name and details now match. <a href="https://www.strava.com/activities/${existing.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab.</span>`;
-      document.title = 'Updated on Strava';
-      markDone(p); btn.disabled = false; return;
+    const epoch = startEpoch(start, p);
+    const elapsed = Math.max(60, Math.round(parseFloat($('#dur').value || '60') * 60));
+    const sets = hasSets(p);
+    let note = '';
+    // "Update" (an edit in Hard Sets) and text-only pushes look for the existing entry first and rewrite its text
+    let existing = (p.update || !sets) && canRead() ? await findExisting(at, epoch) : null;
+    if (!existing && sets) {
+      res.textContent = 'Uploading ' + p.sets.length + ' sets…';
+      const up = await uploadSets(at, p, name, description.replace(/^Volume: .*$\n?/m, ''), epoch, elapsed);
+      if (up.id) return finish(`<span class="ok">Pushed with ${p.sets.length} sets.</span> ${link(up.id)} <span class="small">Strava builds its Volume and muscle map from the sets. You can close this tab.</span>`, 'Pushed to Strava', p);
+      if (up.pending) return finish(`<span class="ok">Uploaded.</span> <span class="small">Strava is still processing the file. Look at Strava in a minute before pushing again.</span>`, 'Uploaded to Strava', p);
+      const dup = /duplicate of[^0-9]*(\d{5,})/i.exec(up.error) || /activities\/(\d{5,})/.exec(up.error);
+      if (dup) {
+        await putText(at, dup[1], name, description);
+        return finish(`<span class="ok">Updated.</span> Strava refused the sets as a duplicate of an activity it already has, so that entry's name and details were updated instead. ${link(dup[1])} <span class="small">It keeps no muscle map. To get one, delete that entry on Strava and push again.</span>`, 'Updated on Strava', p);
+      }
+      note = 'The sets upload failed (' + up.error.replace(/<[^>]*>/g, '').slice(0, 160) + '), so this went as text only. ';
+      existing = canRead() ? await findExisting(at, epoch) : null;
     }
-    const body = {name, sport_type: 'WeightTraining', start_date_local: start + 'Z', elapsed_time: Math.max(60, Math.round(parseFloat($('#dur').value || '60') * 60)), description};
+    if (existing) {
+      await putText(at, existing.id, name, description);
+      return finish(`<span class="ok">Updated.</span> ${esc(note)}Strava already had this session (${esc(existing.name || 'activity')}); its name and details now match. ${link(existing.id)} <span class="small">You can close this tab.</span>`, 'Updated on Strava', p);
+    }
+    const body = {name, sport_type: 'WeightTraining', start_date_local: start + 'Z', elapsed_time: elapsed, description};
     const r = await fetch('https://www.strava.com/api/v3/activities', {method: 'POST', headers: {'Authorization': 'Bearer ' + at, 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     const j = await r.json().catch(() => ({}));
     if (r.status === 409) {
-      res.innerHTML = `<span class="err">Not created: Strava already has an activity at this start time</span> <span class="small">(that is Strava's duplicate check, error 409). If it is this workout, you are done.${canRead() ? ' It was not of a lifting type, so the bridge did not touch it; edit it on Strava if you want these details in it.' : ' Reconnect in step 2 to grant <code>activity:read_all</code>; the bridge then updates that activity instead of stopping here.'}</span>`;
-      document.title = 'Already on Strava';
-      markDone(p); btn.disabled = false; return;
+      return finish(`<span class="err">Not created: Strava already has an activity at this start time</span> <span class="small">(that is Strava's duplicate check, error 409). If it is this workout, you are done.${canRead() ? ' It was not of a lifting type, so the bridge did not touch it; edit it on Strava if you want these details in it.' : ' Reconnect in step 2 to grant <code>activity:read_all</code>; the bridge then updates that activity instead of stopping here.'}</span>`, 'Already on Strava', p);
     }
     if (!r.ok) throw new Error((j.message || 'Strava error') + (j.errors ? ': ' + j.errors.map(e => e.field + ' ' + e.code).join(', ') : '') + ' (' + r.status + ')');
-    res.innerHTML = `<span class="ok">Pushed.</span> <a href="https://www.strava.com/activities/${j.id}" target="_blank" rel="noopener">Open on Strava</a> <span class="small">You can close this tab. For the muscle-map photo, tap Share image in Hard Sets and add it to the activity in the Strava app (the API cannot attach photos).</span>`;
-    document.title = 'Pushed to Strava';
-    markDone(p);
+    return finish(`<span class="ok">Pushed.</span> ${esc(note)}${link(j.id)} <span class="small">You can close this tab.</span>`, 'Pushed to Strava', p);
   } catch(e) { res.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
   btn.disabled = false;
 };
@@ -217,7 +264,7 @@ $('#send').onclick = async () => {
   renderPush(payload);
   // Hard Sets opens this page with auto:true after a save: push without waiting for a tap once the account is connected
   // (update:true, sent after an edit in Hard Sets, runs even when this browser pushed the session before)
-  if (payload && payload.auto && tokens() && tokens().refresh_token && (payload.update || !store.get('done', []).includes(payload.start_date_local))) {
+  if (payload && payload.auto && tokens() && tokens().refresh_token && (payload.update || payload.resend || !store.get('done', []).includes(payload.start_date_local))) {
     $('#pushhint').textContent = payload.update ? 'Updating automatically…' : 'Pushing automatically…';
     $('#send').click();
   } else if (payload && payload.auto && !(tokens() && tokens().refresh_token)) {
